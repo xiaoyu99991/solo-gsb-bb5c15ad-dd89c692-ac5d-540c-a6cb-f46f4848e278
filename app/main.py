@@ -12,8 +12,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from .models import ScenarioIn, TemplateIn, TemplatePreviewIn, TemplateInstantiateIn
-from . import scheduler, templating
+from .models import (
+    ScenarioIn,
+    TemplateIn,
+    TemplatePreviewIn,
+    TemplateInstantiateIn,
+    ExecutionRecordsIn,
+)
+from . import scheduler, templating, execution
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("MW_DATA_DIR", "/data"))
@@ -48,6 +54,21 @@ def init_db() -> None:
                 data        TEXT NOT NULL,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
+            )
+            """
+        )
+        # 已保存场景的实际执行记录：每场景每任务至多一条（整批替换写入）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_records (
+                scenario_id   INTEGER NOT NULL,
+                node_id       TEXT NOT NULL,
+                executed      INTEGER NOT NULL,
+                actual_start  TEXT,
+                actual_end    TEXT,
+                reason        TEXT,
+                updated_at    TEXT NOT NULL,
+                PRIMARY KEY (scenario_id, node_id)
             )
             """
         )
@@ -154,9 +175,106 @@ def update_scenario(scenario_id: int, scenario: ScenarioIn) -> dict:
 def delete_scenario(scenario_id: int) -> dict:
     with get_db() as conn:
         cur = conn.execute("DELETE FROM scenarios WHERE id = ?", (scenario_id,))
-    if cur.rowcount == 0:
-        raise HTTPException(status_code=404, detail="场景不存在")
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="场景不存在")
+        # 同一事务清理执行记录，不留孤儿数据
+        conn.execute("DELETE FROM execution_records WHERE scenario_id = ?", (scenario_id,))
     return {"deleted": scenario_id}
+
+
+# ---------------------------------------------------------------------------
+# 场景的实际执行记录（每任务恰好一条；整批校验通过后单事务替换）
+# ---------------------------------------------------------------------------
+
+def _scenario_row_or_404(conn: sqlite3.Connection, scenario_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM scenarios WHERE id = ?", (scenario_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="场景不存在")
+    return row
+
+
+def _scenario_nodes(scenario_data: dict) -> list[dict]:
+    """按场景保存顺序返回 [{id, name}]（编辑器 state 与 API 格式两种 data 均支持）。"""
+    return [
+        {"id": str(n.get("id", "")), "name": str(n.get("name") or n.get("id", ""))}
+        for n in scenario_data.get("nodes", [])
+    ]
+
+
+def _record_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "node_id": row["node_id"],
+        "executed": bool(row["executed"]),
+        "actual_start": row["actual_start"],
+        "actual_end": row["actual_end"],
+        "reason": row["reason"],
+    }
+
+
+@app.get("/api/scenarios/{scenario_id}/execution")
+def get_execution(scenario_id: int) -> dict:
+    """返回场景全部任务的执行记录（按场景中任务顺序；无记录时 records 为空）。"""
+    with get_db() as conn:
+        row = _scenario_row_or_404(conn, scenario_id)
+        nodes = _scenario_nodes(json.loads(row["data"]))
+        rec_rows = conn.execute(
+            "SELECT * FROM execution_records WHERE scenario_id = ?", (scenario_id,)
+        ).fetchall()
+
+    records_by_id = {r["node_id"]: _record_from_row(r) for r in rec_rows}
+    records = [
+        records_by_id[n["id"]] for n in nodes if n["id"] in records_by_id
+    ]
+    updated_at = rec_rows[0]["updated_at"] if rec_rows else None
+    return {
+        "scenario_id": scenario_id,
+        "complete": len(records_by_id) == len(nodes) and len(nodes) > 0,
+        "updated_at": updated_at,
+        "records": records,
+    }
+
+
+@app.put("/api/scenarios/{scenario_id}/execution")
+def put_execution(scenario_id: int, body: ExecutionRecordsIn) -> dict:
+    """整批保存执行记录。
+
+    先对照场景全部任务做校验（缺漏 / 重复 / 无效引用 / 已执行缺时间 /
+    结束早于开始 / 未执行缺原因），**全部通过后**在同一事务中删除旧记录并
+    写入新记录；任一错误以 422 返回全部问题，不产生任何部分写入。
+    """
+    raw_records = [r.model_dump() for r in body.records]
+    with get_db() as conn:
+        row = _scenario_row_or_404(conn, scenario_id)
+        nodes = _scenario_nodes(json.loads(row["data"]))
+        try:
+            records = execution.validate_and_normalize(
+                [n["id"] for n in nodes], raw_records
+            )
+        except execution.RecordValidationError as exc:
+            # get_db 上下文未执行成功逻辑即关闭（无 commit），保证不落任何数据
+            raise HTTPException(status_code=422, detail={
+                "message": "执行记录校验未通过，整次保存已拒绝",
+                "errors": exc.errors,
+            })
+
+        now = _now()
+        conn.execute("DELETE FROM execution_records WHERE scenario_id = ?", (scenario_id,))
+        conn.executemany(
+            """
+            INSERT INTO execution_records
+                (scenario_id, node_id, executed, actual_start, actual_end, reason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (scenario_id, r["node_id"], 1 if r["executed"] else 0,
+                 r["actual_start"], r["actual_end"], r["reason"], now)
+                for r in records
+            ],
+        )
+
+    return {"scenario_id": scenario_id, "saved": len(records), "updated_at": now}
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +524,7 @@ def export_schedule(payload: dict) -> FileResponse:
         "resolved": payload.pop("__resolved__", None),
         "issues": payload.pop("__issues__", None),
     }
+    execution_records = payload.pop("__execution__", None)
     try:
         result = scheduler.solve(payload)
     except ValueError as exc:
@@ -419,6 +538,8 @@ def export_schedule(payload: dict) -> FileResponse:
     if template_meta["template"] is not None:
         export["kind"] = "template_instance"
         export.update({k: v for k, v in template_meta.items() if v is not None})
+    if execution_records is not None:
+        export["execution"] = execution_records
 
     stamp = f"{datetime.now():%Y%m%d%H%M%S}"
     prefix = "maintenance-template-instance" if "kind" in export else "maintenance-schedule"

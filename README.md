@@ -8,6 +8,11 @@
 前置任务结束时间偏移），输入参数后**预览并实例化为独立场景**，系统解析变量依赖、校验循环引用
 与时间越界后再交给排程器计算；模板、实例与解析后的参数均可写入 JSON 导出。
 
+**实际执行记录**：对已保存场景，可按任务 ID 逐任务登记维护**实际**开始/结束时间，
+或标记**未执行并填写原因**（每任务恰好一条）；保存后逐任务展示相对计划的
+**开始偏差**（早/晚多少分钟）、**时长偏差**（提前结束/超时）与**未执行项原因**。
+缺时间、结束早于开始、引用无效、缺漏或重复都会**整次拒绝保存**，不产生部分数据。
+
 - 后端：FastAPI + SQLite（标准库 `sqlite3`，零额外 ORM 依赖）
 - 前端：原生 HTML / CSS / JavaScript（Canvas 绘制甘特图，无任何前端构建步骤）
 - 部署：单镜像 Docker / docker compose 一键启动
@@ -25,6 +30,10 @@ docker compose up -d --build
 启动后浏览器访问：
 
 > **http://localhost:8000**
+
+打开页面后：左侧编辑维护窗口/资源/任务/依赖，右侧即时排程；顶栏可保存场景，
+保存并恢复后在右侧底部「**📋 实际执行记录**」登记实际执行情况与偏差对比，
+顶栏「🧩 场景模板」进入模板工作台。
 
 停止：
 
@@ -129,7 +138,32 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 - 下拉框选择历史场景 →「↺ 恢复」：完整还原窗口、资源、任务、依赖、禁排期并重算。
 - 「🗑」删除当前选中场景。所有场景持久化在 SQLite `scenarios` 表。
 
-### 5. JSON 导出
+> 提示：顶栏场景下拉显示名称与最近更新时间；执行记录功能仅在**已保存场景**上可用，
+> 编辑器有未保存改动时请先保存场景，以保证「计划时间」与记录引用的任务版本一致。
+
+### 5. 实际执行记录（逐任务偏差对比）
+
+在右侧结果区底部「**📋 实际执行记录**」面板操作（需先恢复一个已保存场景）：
+
+1. 点击「**✍ 登记实际执行**」打开登记表，表中按场景里的每个计划任务（按 ID）生成一行，
+   **每任务恰好一条**记录：
+   - **已执行**：填写实际开始、实际结束时间（分钟粒度）；
+   - **未执行**：把状态切为「未执行」并**必填原因**（如“备用网络未到位、窗口取消”）。
+2. 「💾 保存执行记录（整批）」一次性提交全部任务：
+   - 已执行项缺少任一时间、时间格式无效、**实际结束早于开始**；
+   - 未执行项未填原因；记录**缺漏 / 重复 / 引用了场景外任务**；
+   - 以上任一情况都会**整次拒绝保存**，错误框列出全部问题并高亮对应行，
+     **不留任何部分数据**（前端先做一遍校验，后端在同一事务中再次校验后才落库）。
+3. 保存成功后逐任务展示对比结果：
+   - **开始偏差**：实际开始 − 计划开始，正数红色“晚于计划”，负数绿色“早于计划”，0 为准点；
+   - **时长偏差**：实际时长（实际结束−实际开始）− 计划时长，正为超时、负为提前结束；
+   - **未执行项**：顶部汇总条列出未执行数量与每条原因，表格中整行红色标记；
+   - 计划本身未能排程的任务无法比较偏差，会标注“计划未排程”。
+4. 再次提交为**整批替换**（以最近一次提交为准）；删除场景时其执行记录一并清理。
+
+执行记录持久化在 SQLite `execution_records` 表（主键 `场景 id + 任务 id`）。
+
+### 6. JSON 导出
 
 「⬇ 导出 JSON」会下载 `maintenance-schedule-<时间戳>.json`（模板实例则为
 `maintenance-template-instance-<时间戳>.json`），内容同时包含：
@@ -140,6 +174,7 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
   "scenario": { "…当前编辑场景的完整输入…" },
   "result":   { "feasible": true, "items": [ …排程明细… ], "order": [],
                 "unscheduled": [], "conflicts": [], "stats": {}, "window": {} },
+  "execution": { "…该场景已保存的实际执行记录（存在时附带）…" },
   "kind": "template_instance",
   "template": { "…模板定义（仅模板实例）…" },
   "params":   { "…实例化时输入的参数（仅模板实例）…" },
@@ -147,7 +182,7 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 }
 ```
 
-### 6. 场景模板（含变量）
+### 7. 场景模板（含变量）
 
 点击顶栏「**🧩 场景模板**」打开模板工作台，左右两栏：左边定义模板，右边输入参数 → 预览 → 实例化。
 
@@ -232,7 +267,9 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 | POST | `/api/scenarios` | 新建或按同名更新场景 `{name, data}` |
 | GET | `/api/scenarios/{id}` | 恢复某场景（含完整 data） |
 | PUT | `/api/scenarios/{id}` | 更新场景 |
-| DELETE | `/api/scenarios/{id}` | 删除场景 |
+| DELETE | `/api/scenarios/{id}` | 删除场景（其执行记录在同一事务级联清理） |
+| GET | `/api/scenarios/{id}/execution` | 读取场景的实际执行记录（按任务顺序，含 `complete` 标记） |
+| PUT | `/api/scenarios/{id}/execution` | 整批保存执行记录 `{records:[…]}`；校验不过返回 422 + 全部 `errors`，不写入部分数据 |
 | GET | `/api/templates` | 模板列表 |
 | POST | `/api/templates` | 新建 / 同名更新模板 `{name, data}`（保存前做结构校验） |
 | GET | `/api/templates/{id}` | 获取模板（含完整 data） |
@@ -261,6 +298,26 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
     { "name": "计费批处理", "start": "2026-09-24T00:00", "end": "2026-09-24T00:30" }
   ]
 }
+```
+
+执行记录请求体（`PUT /api/scenarios/{id}/execution`，每任务恰好一条）：
+
+```json
+{
+  "records": [
+    { "node_id": "a", "executed": true,
+      "actual_start": "2026-09-23T22:05", "actual_end": "2026-09-23T22:40", "reason": null },
+    { "node_id": "b", "executed": false,
+      "actual_start": null, "actual_end": null, "reason": "DBA 通宵不可用，取消执行" }
+  ]
+}
+```
+
+校验失败时 `422` 返回（前端整次拒绝、高亮出错行）：
+
+```json
+{ "detail": { "message": "执行记录校验未通过，整次保存已拒绝",
+              "errors": [ { "node_id": "b", "message": "任务 b 的实际结束时间不能早于实际开始时间" } ] } }
 ```
 
 模板请求体示例（`POST /api/templates/preview`）：
@@ -307,16 +364,19 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI：API、SQLite（scenarios/templates）、静态托管、导出
+│   ├── main.py            # FastAPI：API、SQLite（scenarios/templates/execution_records）、静态托管、导出
 │   ├── scheduler.py       # DAG 环检测 / 拓扑排序 / 资源+禁排期排程
+│   ├── execution.py       # 实际执行记录校验（缺漏/重复/无效引用/缺时间/结束早于开始/缺原因）
 │   ├── templating.py      # 场景模板：表达式词法/语法、变量解析、锚点环检测、时间越界校验
 │   ├── models.py          # Pydantic 模型
 │   └── static/
-│       ├── index.html     # 编辑器 + 结果区 + 模板工作台弹窗
-│       ├── app.js         # 原生 JS：表格编辑、Canvas 甘特图、拖拽、场景、导出
+│       ├── index.html     # 编辑器 + 结果区 + 执行记录面板/弹窗 + 模板工作台弹窗
+│       ├── app.js         # 原生 JS：表格编辑、Canvas 甘特图、拖拽、场景、执行记录、导出
 │       ├── templates.js   # 模板工作台：变量编辑、参数预览、迷你甘特、实例化
 │       └── styles.css
 ├── test_scheduler.py      # 排程核心测试（53 项断言，无需第三方库）
+├── test_execution.py      # 执行记录校验与 API 测试（39 项断言，需 fastapi/httpx）
+├── test_frontend_exec.js  # 执行记录前端流程测试（25 项断言，仅需 node）
 ├── test_templating.py     # 模板引擎测试（47 项断言，无需第三方库）
 ├── requirements.txt
 ├── Dockerfile
@@ -326,9 +386,11 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 运行后端测试：
 
 ```bash
-pip install -r requirements.txt   # 测试仅依赖 fastapi（含 pydantic）
+pip install -r requirements.txt   # 测试仅依赖 fastapi（含 pydantic）；API 测试另需 httpx
 python test_scheduler.py
+python test_execution.py
 python test_templating.py
+node test_frontend_exec.js        # 前端执行记录登记 / 校验 / 偏差展示流程
 ```
 
 ---

@@ -18,6 +18,10 @@ let lastResult = null;
 let recomputeTimer = null;
 let recomputing = false;
 let dirty = false;
+let scenarioDirty = false;  // 编辑器相对已保存场景是否有未保存改动
+let currentScenarioId = null;   // 当前编辑器内容对应的已保存场景 id
+let executionData = null;       // {complete, updated_at, records:[…]}
+let execFormNodes = null;       // 登记弹窗当前编辑的任务快照
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -221,7 +225,7 @@ function onEditorChange(ev) {
     touched = true;
   }
 
-  if (touched) { dirty = true; scheduleRecompute(); }
+  if (touched) { dirty = true; scenarioDirty = true; scheduleRecompute(); }
 }
 
 $("#btnAddResource").onclick = () => {
@@ -230,6 +234,7 @@ $("#btnAddResource").onclick = () => {
   while (state.resources.some((r) => r.name === name)) name = base + (++k);
   state.resources.push({ name, capacity: 1 });
   renderResources();
+  scenarioDirty = true;
   scheduleRecompute();
 };
 $("#btnAddNode").onclick = () => {
@@ -237,18 +242,21 @@ $("#btnAddNode").onclick = () => {
               duration_minutes: 30, resources: {}, fixed_start: null };
   state.nodes.push(n);
   renderNodes();
+  scenarioDirty = true;
   scheduleRecompute();
 };
 $("#btnAddEdge").onclick = () => {
   if (state.nodes.length < 1) return toast("请先添加任务", true);
   state.edges.push({ source: state.nodes[0].id, target: state.nodes[state.nodes.length - 1].id });
   renderEdges();
+  scenarioDirty = true;
   scheduleRecompute();
 };
 $("#btnAddBlackout").onclick = () => {
   state.blackouts.push({ id: uid("b"), name: "禁排期" + (state.blackouts.length + 1),
                          start: "", end: "" });
   renderBlackouts();
+  scenarioDirty = true;
   scheduleRecompute();
 };
 
@@ -368,6 +376,7 @@ function renderResult() {
   renderScheduleTable();
   renderLegend();
   drawGantt();
+  renderExecution();
 }
 
 function renderScheduleTable() {
@@ -729,6 +738,7 @@ window.addEventListener("mousemove", (ev) => {
 window.addEventListener("mouseup", () => {
   if (drag && drag.moved) {
     recompute(false);
+    scenarioDirty = true;
     if (drag.mode === "move") toast(`「${nodeName(drag.id)}」已锁定到新时间，双击甘特条可解锁`);
   }
   drag = null;
@@ -742,6 +752,7 @@ canvas.addEventListener("dblclick", (ev) => {
   if (n.fixed_start) {
     n.fixed_start = null;
     syncFixedInput(n);
+    scenarioDirty = true;
     recompute(false);
     toast(`「${n.name}」已解除固定时间`);
   }
@@ -818,8 +829,11 @@ $("#btnSave").onclick = async () => {
   if (!resp.ok) return toast("保存失败：" + (await resp.json()).detail, true);
   const rj = await resp.json();
   toast(rj.updated ? `场景「${name}」已更新` : `场景「${name}」已保存`);
+  currentScenarioId = rj.id;
+  scenarioDirty = false;
   $("#scenarioSelect").value = rj.id;
-  loadScenarioList();
+  await loadScenarioList();
+  await refreshExecution();
 };
 
 $("#btnLoad").onclick = loadSelected;
@@ -833,8 +847,11 @@ async function loadSelected() {
   const sc = await resp.json();
   deserializeState(sc.data);
   $("#scenarioName").value = sc.name;
+  currentScenarioId = sc.id;
+  scenarioDirty = false;
   lastResult = null;
   await recompute(false);
+  await refreshExecution();
   toast(`已恢复场景「${sc.name}」`);
 }
 
@@ -846,9 +863,282 @@ $("#btnDelete").onclick = async () => {
   if (!resp.ok) return toast("删除失败", true);
   $("#scenarioSelect").value = "";
   $("#scenarioName").value = "";
+  if (String(currentScenarioId) === String(id)) {
+    currentScenarioId = null;
+    executionData = null;
+    renderExecution();
+  }
+  scenarioDirty = false;
   loadScenarioList();
   toast("场景已删除");
 };
+
+// ---------------------------------------------------------------------------
+// 实际执行记录（按任务 ID 逐任务登记：实际开始/结束，或未执行+原因）
+// ---------------------------------------------------------------------------
+function fmtDelta(mins, positiveText = "晚", negativeText = "早", zeroText = "准点") {
+  const m = Math.round(mins);
+  const abs = fmtDur(Math.abs(m));
+  if (m === 0) return { text: zeroText, cls: "delta-zero" };
+  const sign = m > 0 ? `+${m}` : `${m}`;
+  return { text: `${sign} 分（${m > 0 ? positiveText : negativeText} ${abs}）`,
+           cls: m > 0 ? "delta-late" : "delta-early" };
+}
+
+function plannedItemMap() {
+  const m = new Map();
+  (lastResult?.items || []).forEach((it) => m.set(it.id, it));
+  return m;
+}
+
+async function refreshExecution() {
+  executionData = null;
+  if (currentScenarioId == null) {
+    renderExecution();
+    return;
+  }
+  try {
+    const resp = await fetch(`/api/scenarios/${currentScenarioId}/execution`);
+    if (resp.ok) executionData = await resp.json();
+  } catch (e) { /* 网络异常时按无记录渲染 */ }
+  renderExecution();
+}
+
+function renderExecution() {
+  const box = $("#execBox");
+  const summary = $("#execSummary");
+  const hint = $("#execHint");
+  const btn = $("#btnExecEdit");
+
+  if (currentScenarioId == null) {
+    btn.disabled = true;
+    hint.textContent = "";
+    summary.classList.add("hidden");
+    box.innerHTML = `<span class="hint">恢复一个已保存场景后，可在此登记每个计划任务的实际开始/结束时间，或标记未执行并说明原因。</span>`;
+    return;
+  }
+
+  btn.disabled = false;
+  if (scenarioDirty) {
+    hint.innerHTML = `<span class="delta-late">⚠ 编辑器有未保存改动，偏差以当前排程为准；请先「💾 保存场景」再提交记录</span>`;
+  } else {
+    hint.textContent = "";
+  }
+
+  const records = executionData?.records || [];
+  if (!records.length) {
+    summary.classList.add("hidden");
+    box.innerHTML = `<span class="hint">尚无执行记录，点击「✍ 登记实际执行」为 ${state.nodes.length} 个计划任务逐任务填写。</span>`;
+    return;
+  }
+
+  const updated = executionData.updated_at
+    ? executionData.updated_at.replace("T", " ").slice(0, 16) : "";
+  const planned = plannedItemMap();
+  const nameOf = (id) => planned.get(id)?.name || nodeById(id)?.name || id;
+
+  const executed = records.filter((r) => r.executed);
+  const notExecuted = records.filter((r) => !r.executed);
+
+  // 汇总条：已执行/未执行 + 未执行原因清单
+  summary.classList.remove("hidden");
+  summary.innerHTML =
+    `<span class="exec-chip">已执行 ${executed.length}/${records.length}</span>` +
+    (notExecuted.length
+      ? `<span class="exec-chip exec-chip-skip">未执行 ${notExecuted.length}</span>` +
+        notExecuted.map((r) =>
+          `<span class="exec-skip-item"><b>${esc(nameOf(r.node_id))}</b>：${esc(r.reason)}</span>`
+        ).join("")
+      : `<span class="exec-chip exec-chip-ok">✔ 全部任务均已执行</span>`) +
+    (updated ? `<span class="exec-updated">最近保存：${esc(updated)}</span>` : "");
+
+  // 逐任务：开始偏差 / 时长偏差 / 未执行
+  box.innerHTML = `
+    <table class="mini-table exec-table">
+      <thead>
+        <tr><th>任务</th><th>计划时段</th><th>实际时段</th>
+            <th>开始偏差</th><th>时长偏差</th><th>执行情况</th></tr>
+      </thead>
+      <tbody>
+      ${records.map((r) => {
+        const nid = r.node_id;
+        const it = planned.get(nid);
+        const name = nameOf(nid);
+        if (!r.executed) {
+          return `<tr class="row-skipped">
+            <td><b>${esc(name)}</b><br><span class="hint">${esc(nid)}</span></td>
+            <td>${it ? esc(it.start_label) + " ~ " + esc(it.end_label) : "—"}</td>
+            <td colspan="3"><span class="skip-tag">未执行</span></td>
+            <td><span class="skip-reason">${esc(r.reason)}</span></td>
+          </tr>`;
+        }
+        let startCell, durCell;
+        if (it) {
+          const startDelta = (parseDT(r.actual_start) - parseDT(it.start)) / 60000;
+          const actualDur = (parseDT(r.actual_end) - parseDT(r.actual_start)) / 60000;
+          const durDelta = actualDur - it.duration_minutes;
+          const ds = fmtDelta(startDelta, "晚于计划", "早于计划");
+          const dd = fmtDelta(durDelta, "超时", "提前结束", "时长一致");
+          startCell = `<span class="${ds.cls}">${esc(ds.text)}</span>`;
+          durCell = `<span class="${dd.cls}">${esc(dd.text)}</span>`;
+        } else {
+          startCell = durCell = `<span class="hint">计划未排程，无法比较</span>`;
+        }
+        return `<tr>
+          <td><b>${esc(name)}</b><br><span class="hint">${esc(nid)}</span></td>
+          <td>${it ? esc(it.start_label) + " ~ " + esc(it.end_label) : "—（未排程）"}</td>
+          <td>${esc(fmtDT(r.actual_start))} ~ ${esc(fmtDT(r.actual_end))}</td>
+          <td>${startCell}</td><td>${durCell}</td>
+          <td><span class="done-tag">已执行</span></td>
+        </tr>`;
+      }).join("")}
+      </tbody>
+    </table>`;
+}
+
+$("#btnExecEdit").onclick = openExecModal;
+
+async function openExecModal() {
+  if (currentScenarioId == null) {
+    return toast("请先在顶栏选择并「恢复」一个已保存场景", true);
+  }
+  if (scenarioDirty) {
+    return toast("编辑器有未保存改动，请先保存场景后再登记执行记录", true);
+  }
+  // 以服务端保存的场景任务列表为准，避免引用无效 / 漏填
+  const resp = await fetch(`/api/scenarios/${currentScenarioId}`);
+  if (!resp.ok) return toast("无法读取场景", true);
+  const sc = await resp.json();
+  const savedNodes = (sc.data?.nodes || []).map((n) => ({ id: String(n.id), name: n.name || n.id }));
+  if (!savedNodes.length) return toast("该场景没有计划任务，无可登记记录", true);
+
+  $("#execModalScenario").textContent = sc.name;
+  $("#execFormError").classList.add("hidden");
+  $("#execFormError").innerHTML = "";
+  let existing = [];
+  if (executionData && executionData.records) existing = executionData.records;
+  execFormNodes = savedNodes.map((n) => {
+    const old = existing.find((r) => r.node_id === n.id);
+    return {
+      ...n,
+      executed: old ? old.executed : true,
+      actual_start: old?.actual_start || "",
+      actual_end: old?.actual_end || "",
+      reason: old?.reason || "",
+    };
+  });
+  renderExecForm([]);
+  $("#execModal").classList.remove("hidden");
+}
+
+function renderExecForm(errorIds) {
+  const errorSet = new Set(errorIds || []);
+  const planned = plannedItemMap();
+  $("#execFormTable tbody").innerHTML = execFormNodes.map((n, i) => {
+    const it = planned.get(n.id);
+    return `<tr data-execrow="${esc(n.id)}" class="${errorSet.has(n.id) ? "exec-row-err" : ""} ${n.executed ? "" : "row-skipped"}">
+      <td><b>${esc(n.name)}</b><br><span class="hint">${esc(n.id)}</span></td>
+      <td class="hint">${it ? esc(it.start_label) + "~" + esc(it.end_label) : "（计划未排程）"}</td>
+      <td>
+        <select data-exi="${i}" data-exk="executed">
+          <option value="true" ${n.executed ? "selected" : ""}>已执行</option>
+          <option value="false" ${n.executed ? "" : "selected"}>未执行</option>
+        </select>
+      </td>
+      <td><input type="datetime-local" step="60" data-exi="${i}" data-exk="actual_start"
+                 value="${esc(n.actual_start)}" ${n.executed ? "" : "disabled"} /></td>
+      <td><input type="datetime-local" step="60" data-exi="${i}" data-exk="actual_end"
+                 value="${esc(n.actual_end)}" ${n.executed ? "" : "disabled"} /></td>
+      <td><input data-exi="${i}" data-exk="reason" value="${esc(n.reason)}"
+                 placeholder="未执行时必填原因" ${n.executed ? "disabled" : ""} /></td>
+    </tr>`;
+  }).join("");
+}
+
+$("#execFormTable").addEventListener("input", (ev) => {
+  const t = ev.target;
+  if (t.dataset.exk && t.dataset.exk !== "executed") {
+    execFormNodes[+t.dataset.exi][t.dataset.exk] = t.value;
+  }
+});
+$("#execFormTable").addEventListener("change", (ev) => {
+  const t = ev.target;
+  if (t.dataset.exk === "executed") {
+    execFormNodes[+t.dataset.exi].executed = t.value === "true";
+    renderExecForm([]);
+  }
+});
+
+function collectExecRecords() {
+  return execFormNodes.map((n) => ({
+    node_id: n.id,
+    executed: n.executed,
+    actual_start: n.executed ? n.actual_start || null : null,
+    actual_end: n.executed ? n.actual_end || null : null,
+    reason: n.executed ? null : (n.reason.trim() || null),
+  }));
+}
+
+$("#execBtnSave").onclick = async () => {
+  const clientErrors = [];
+  const badIds = [];
+  collectExecRecords().forEach((r) => {
+    if (r.executed) {
+      if (!r.actual_start || !r.actual_end) {
+        clientErrors.push(`任务 ${r.node_id}：已执行但缺少实际开始或结束时间`);
+        badIds.push(r.node_id);
+      } else if (parseDT(r.actual_end) < parseDT(r.actual_start)) {
+        clientErrors.push(`任务 ${r.node_id}：实际结束时间早于开始时间`);
+        badIds.push(r.node_id);
+      }
+    } else if (!r.reason) {
+      clientErrors.push(`任务 ${r.node_id}：标记未执行但未填写原因`);
+      badIds.push(r.node_id);
+    }
+  });
+  if (clientErrors.length) {
+    showExecFormErrors(clientErrors);
+    renderExecForm(badIds);
+    return;
+  }
+
+  const resp = await fetch(`/api/scenarios/${currentScenarioId}/execution`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ records: collectExecRecords() }),
+  });
+  if (resp.status === 422) {
+    const err = await resp.json().catch(() => ({}));
+    const detail = err.detail;
+    if (detail && typeof detail === "object" && Array.isArray(detail.errors)) {
+      const ids = detail.errors.map((e) => e.node_id).filter(Boolean);
+      showExecFormErrors(detail.errors.map((e) => e.message));
+      renderExecForm(ids);
+    } else {
+      toast("保存被拒绝：" + (typeof detail === "string" ? detail : "校验失败"), true);
+    }
+    return;
+  }
+  if (!resp.ok) return toast(`保存失败 HTTP ${resp.status}`, true);
+
+  $("#execModal").classList.add("hidden");
+  toast("执行记录已整批保存");
+  await refreshExecution();
+};
+
+function showExecFormErrors(messages) {
+  const box = $("#execFormError");
+  box.classList.remove("hidden");
+  box.innerHTML = `<b>整次保存被拒绝（未写入任何数据）：</b><ul>` +
+    messages.map((m) => `<li>${esc(m)}</li>`).join("") + `</ul>`;
+}
+
+function closeExecModal() { $("#execModal").classList.add("hidden"); }
+$("#execBtnClose").onclick = closeExecModal;
+$("#execBtnCancel").onclick = closeExecModal;
+$("#execModal").addEventListener("click", (ev) => {
+  if (ev.target === $("#execModal")) closeExecModal();
+});
 
 // ---------------------------------------------------------------------------
 // JSON 导出
@@ -864,6 +1154,13 @@ $("#btnExport").onclick = async () => {
       __resolved__: state.templateRef.resolved || null,
       __issues__: state.templateRef.issues || [],
     });
+  }
+  if (executionData && executionData.records && executionData.records.length) {
+    extra.__execution__ = {
+      scenario_id: currentScenarioId,
+      updated_at: executionData.updated_at,
+      records: executionData.records,
+    };
   }
   const resp = await fetch("/api/export", {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -929,6 +1226,10 @@ $("#btnSample").onclick = () => {
   $("#winStart").value = state.windowStart;
   $("#winEnd").value = state.windowEnd;
   renderAll();
+  currentScenarioId = null;
+  scenarioDirty = true;
+  executionData = null;
+  renderExecution();
   recompute(false);
   toast("已载入示例：可试着拖动甘特条、添加依赖制造循环");
 };
@@ -950,13 +1251,16 @@ window.SchedulerApp = {
     uid: state.uid,
   }),
   // 模板实例化后载入为当前编辑场景
-  loadInstance(data, name, id) {
+  async loadInstance(data, name, id) {
     deserializeState(data);
     state.templateRef = data.templateRef || null;
     lastResult = null;
-    recompute(false);
+    currentScenarioId = id;
+    scenarioDirty = false;
+    await recompute(false);
     $("#scenarioName").value = name;
     $("#scenarioSelect").value = id;
+    await refreshExecution();
   },
   async refreshScenarioList() {
     await loadScenarioList();
@@ -972,6 +1276,7 @@ window.SchedulerApp = {
   $("#winEnd").value = state.windowEnd;
   renderAll();
   loadScenarioList();
+  renderExecution();
   recompute(false);
   // 首次交互后提示拖拽
   setTimeout(() => { if (lastResult && lastResult.feasible) toast("可直接拖动甘特条调整时间，松开即自动重算"); }, 800);

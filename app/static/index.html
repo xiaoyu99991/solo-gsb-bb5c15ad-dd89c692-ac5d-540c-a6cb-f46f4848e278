@@ -104,10 +104,59 @@
           <tbody></tbody>
         </table>
       </div>
+
+      <div class="exec-wrap" id="execWrap">
+        <div class="exec-head">
+          <h3>📋 实际执行记录 <span class="hint" id="execHint"></span></h3>
+          <button id="btnExecEdit" class="btn btn-small btn-primary">✍ 登记实际执行</button>
+        </div>
+        <div id="execSummary" class="exec-summary hidden"></div>
+        <div id="execBox" class="exec-box">
+          <span class="hint">恢复一个已保存场景后，可在此登记每个计划任务的实际开始/结束时间，或标记未执行并说明原因。</span>
+        </div>
+      </div>
     </section>
   </main>
 
   <div id="toast" class="toast hidden"></div>
+
+  <!-- 实际执行记录登记弹窗 -->
+  <div id="execModal" class="modal-mask hidden">
+    <div class="modal modal-exec">
+      <div class="modal-head">
+        <b>✍ 登记实际执行记录</b>
+        <div class="modal-head-actions">
+          <button id="execBtnClose" class="btn btn-small">✕ 关闭</button>
+        </div>
+      </div>
+      <div class="modal-body-exec">
+        <div class="exec-form-hint">
+          场景「<b id="execModalScenario">—</b>」：为<span class="req">每个计划任务恰好填写一条</span>记录——
+          已执行请填实际开始/结束时间；未执行请勾选并写明原因。任一项有误将整次拒绝保存，不会保留部分数据。
+        </div>
+        <div id="execFormError" class="exec-form-error hidden"></div>
+        <div class="exec-form-table-wrap">
+          <table class="mini-table" id="execFormTable">
+            <thead>
+              <tr>
+                <th style="width:130px">任务（ID）</th>
+                <th style="width:150px">计划时段</th>
+                <th style="width:110px">状态</th>
+                <th>实际开始</th>
+                <th>实际结束</th>
+                <th style="min-width:170px">未执行原因</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-foot" style="display:flex;justify-content:flex-end;gap:8px">
+        <button id="execBtnCancel" class="btn btn-small">取消</button>
+        <button id="execBtnSave" class="btn btn-small btn-primary">💾 保存执行记录（整批）</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 场景模板工作台 -->
   <div id="tplModal" class="modal-mask hidden">
