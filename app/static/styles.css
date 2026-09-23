@@ -296,3 +296,50 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   border-right: 1px dashed rgba(239,91,107,.6);
 }
 
+/* ---------- 实际执行记录弹窗 ---------- */
+.exec-modal { width: min(1100px, 100%); max-height: 92vh; }
+.exec-body {
+  display: flex; flex-direction: column;
+  overflow: hidden; padding: 12px 16px; gap: 10px;
+}
+.exec-toolbar { flex: none; display: flex; flex-direction: column; gap: 8px; }
+.exec-summary {
+  font-size: 13px; color: var(--text, #c6d0e6);
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 10px;
+}
+.exec-ok { color: #78e0a8; font-weight: 600; }
+.exec-warn { color: #e8c869; font-weight: 600; }
+.exec-bad { color: #ff8191; font-weight: 600; }
+.exec-report-bar {
+  border-radius: 8px; padding: 7px 10px; font-size: 13px; font-weight: 600;
+}
+.exec-report-bar.ok { background: #122018; border: 1px solid #274d38; color: #78e0a8; }
+.exec-report-bar.warn { background: #2c2617; border: 1px solid #5c4c24; color: #e8c869; }
+
+.exec-table-wrap { flex: 1; overflow-y: auto; min-height: 120px; }
+.exec-table th { white-space: nowrap; }
+.exec-table .exec-plan { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.exec-row .exec-reason-input { display: none; width: 100%; }
+.exec-row .exec-dev { font-size: 11px; display: flex; flex-direction: column; gap: 1px; }
+.exec-row.is-skipped .exec-reason-input { display: block; }
+.exec-row.is-skipped .exec-dev { display: none; }
+.exec-row.is-skipped .exec-times input {
+  opacity: .35; pointer-events: none; background: transparent;
+}
+.exec-row.row-error td { background: rgba(239,91,107,.12); }
+.exec-dev-item { font-family: ui-monospace, Menlo, monospace; }
+.exec-dev-item.zero { color: #78e0a8; }
+.exec-dev-item.late { color: #ff8191; }
+.exec-dev-item.early { color: #e8c869; }
+.exec-dev-item.muted, .hint { color: var(--muted); }
+
+.exec-skipped-box {
+  flex: none; max-height: 150px; overflow-y: auto;
+  background: #2a1a22; border: 1px solid #5c3040;
+  border-radius: 8px; padding: 8px 12px;
+}
+.exec-skipped-box h4 { margin: 0 0 5px; color: #ff9aa5; font-size: 12px; }
+.exec-skipped-box ul { margin: 0; padding-left: 18px; font-size: 12px; color: #e6c4ca; }
+.exec-skipped-box li { padding: 2px 0; }
+

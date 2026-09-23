@@ -3,6 +3,8 @@
 在指定维护窗口内，对带**服务依赖 DAG、维护时长、资源占用、禁排时间段**的一批维护任务自动求解：
 计算满足依赖与资源容量约束的**可执行顺序和开始/结束时间**，检测**循环依赖**与**资源重叠**，
 给出**可定位的冲突链**；甘特图上可拖动调整窗口并即时重算，支持场景保存/恢复与 JSON 导出。
+维护完成后，还可为**已保存场景逐任务登记实际执行记录**（实际开始/结束或未执行原因），
+系统按计划逐项给出**开始偏差、时长偏差**并汇总**未执行项**；记录整批校验、原子保存。
 
 另提供**场景模板**：可把窗口、资源、任务及依赖保存为**含变量的模板**（基准日期、任务时长、
 前置任务结束时间偏移），输入参数后**预览并实例化为独立场景**，系统解析变量依赖、校验循环引用
@@ -18,19 +20,29 @@
 
 ### 方式 A：docker compose（推荐，一键）
 
+在项目根目录（含 `docker-compose.yml`）执行：
+
 ```bash
+# 一键构建镜像并后台启动（首次会自动构建；数据库表在容器启动时自动创建）
 docker compose up -d --build
+
+# 查看运行状态与健康检查
+docker compose ps
+curl http://localhost:8000/api/health
 ```
 
 启动后浏览器访问：
 
 > **http://localhost:8000**
 
+页面顶栏各入口：「💾 保存场景 / ↺ 恢复」管理计划，「📋 执行记录」在维护结束后
+逐任务回填实际执行情况，「⬇ 导出 JSON」下载计划与结果。
+
 停止：
 
 ```bash
-docker compose down            # 保留数据（命名卷 scheduler-data）
-docker compose down -v         # 同时删除保存的场景数据
+docker compose down            # 保留数据（命名卷 scheduler-data：场景、模板、执行记录）
+docker compose down -v         # 同时删除全部已保存数据
 ```
 
 ### 方式 B：单条 docker 命令
@@ -127,9 +139,32 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 
 - 输入场景名称 →「💾 保存场景」：同名场景执行**更新（upsert）**，异名新建。
 - 下拉框选择历史场景 →「↺ 恢复」：完整还原窗口、资源、任务、依赖、禁排期并重算。
-- 「🗑」删除当前选中场景。所有场景持久化在 SQLite `scenarios` 表。
+- 「🗑」删除当前选中场景（其执行记录一并删除）。所有场景持久化在 SQLite `scenarios` 表。
 
-### 5. JSON 导出
+### 5. 实际执行记录（维护结束后回填）
+
+顶栏「**📋 执行记录**」为**当前选中的已保存场景**逐任务登记实际执行情况（每个计划任务恰好一条）：
+
+- **已执行**：填写该任务 ID 对应的**实际开始时间**与**实际结束时间**（`datetime-local`）；
+- **未执行**：切换状态为「未执行」并**填写原因**（如"上游故障顺延"）。
+- 「**↧ 按计划时间填充空项**」可把已执行行的空时间批量填成计划开始/结束，便于微调。
+- 「**💾 保存执行记录**」后，逐任务显示相对当前计划的：
+  - **开始偏差**：实际开始 − 计划开始（正=延后、负=提前、0=准点，单位分钟）；
+  - **时长偏差**：实际时长 − 计划时长（正=超时、负=少于计划）；
+  - 顶部汇总与「**🚫 未执行项**」清单（任务、ID、原因）。
+- 计划中因冲突**未排程**的任务也在表中列出：实际执行了也能登记，但没有计划基线，不计算偏差。
+
+**整批校验、原子保存**：以下任一情况都会以 `422` **拒绝整次保存**，错误逐条标红定位，
+数据库不写入任何部分数据（旧记录保持不变）：
+
+- 某个已执行项缺少实际开始或结束时间，或实际结束早于实际开始；
+- 某个任务标记未执行却没填原因；
+- 记录引用了场景中不存在的任务 ID；任务有遗漏或同一任务出现多条（必须每任务恰好一条）。
+
+记录保存在独立的 SQLite `execution_records` 表（`(scenario_id, node_id)` 联合主键，
+外键级联删除）；保存后重算的偏差始终以场景**当前保存的计划**为基线，重复保存整批替换。
+
+### 6. JSON 导出
 
 「⬇ 导出 JSON」会下载 `maintenance-schedule-<时间戳>.json`（模板实例则为
 `maintenance-template-instance-<时间戳>.json`），内容同时包含：
@@ -147,7 +182,7 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 }
 ```
 
-### 6. 场景模板（含变量）
+### 7. 场景模板（含变量）
 
 点击顶栏「**🧩 场景模板**」打开模板工作台，左右两栏：左边定义模板，右边输入参数 → 预览 → 实例化。
 
@@ -232,7 +267,9 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 | POST | `/api/scenarios` | 新建或按同名更新场景 `{name, data}` |
 | GET | `/api/scenarios/{id}` | 恢复某场景（含完整 data） |
 | PUT | `/api/scenarios/{id}` | 更新场景 |
-| DELETE | `/api/scenarios/{id}` | 删除场景 |
+| DELETE | `/api/scenarios/{id}` | 删除场景（级联删除其执行记录） |
+| GET | `/api/scenarios/{id}/executions` | 该场景每个任务的执行记录与偏差报告（开始/时长偏差、未执行清单、缺项） |
+| PUT | `/api/scenarios/{id}/executions` | 整批保存执行记录 `{records:[{node_id, executed, actual_start, actual_end, reason}]}`；任一项不合法返回 422 `{message, issues}` 并拒绝整次保存 |
 | GET | `/api/templates` | 模板列表 |
 | POST | `/api/templates` | 新建 / 同名更新模板 `{name, data}`（保存前做结构校验） |
 | GET | `/api/templates/{id}` | 获取模板（含完整 data） |
@@ -300,6 +337,39 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 实例化（`POST /api/templates/instantiate`）在上述基础上增加 `"template_id"`（可选，
 不传则使用内联 `data`）与 `"name"`（实例场景名称），返回 `{id, name, data, result, resolved, issues}`。
 
+执行记录请求体示例（`PUT /api/scenarios/{id}/executions`，每任务恰好一条）：
+
+```json
+{
+  "records": [
+    { "node_id": "a", "executed": true,
+      "actual_start": "2026-09-23T22:10", "actual_end": "2026-09-23T22:50" },
+    { "node_id": "b", "executed": false,
+      "actual_start": null, "actual_end": null, "reason": "上游故障，顺延次日" }
+  ]
+}
+```
+
+成功返回逐任务偏差报告；任一记录不合法时返回 `422`：
+
+```json
+{
+  "detail": {
+    "message": "存在不合法的执行记录，整次保存已拒绝（未写入任何数据）",
+    "issues": [
+      { "node_id": "a", "message": "「切流量」已标记为执行，但缺少实际开始时间" },
+      { "node_id": "b", "message": "「升级」的实际结束时间（…）早于实际开始时间（…）" }
+    ]
+  }
+}
+```
+
+`GET / PUT` 返回体要点：`items[]` 中每项含 `node_id/name/scheduled/planned_start/
+planned_end/planned_duration_minutes/record` 以及 `start_deviation_minutes`、
+`duration_deviation_minutes`（分钟，正=延后/超时；未执行或无计划基线时为 `null`）；
+顶层另有 `skipped`（未执行清单）、`missing`（缺登记任务 ID）、`dangling`（无效引用）
+与 `summary`（`total/recorded/executed/skipped/missing`）。
+
 ---
 
 ## 六、目录结构与测试
@@ -307,28 +377,32 @@ APP_PORT=9000 docker compose up -d --build   # 访问 http://localhost:9000
 ```
 .
 ├── app/
-│   ├── main.py            # FastAPI：API、SQLite（scenarios/templates）、静态托管、导出
+│   ├── main.py            # FastAPI：API、SQLite（scenarios/templates/execution_records）、静态托管、导出
 │   ├── scheduler.py       # DAG 环检测 / 拓扑排序 / 资源+禁排期排程
 │   ├── templating.py      # 场景模板：表达式词法/语法、变量解析、锚点环检测、时间越界校验
+│   ├── executions.py      # 实际执行记录：全量校验、整批原子替换、开始/时长偏差报告
 │   ├── models.py          # Pydantic 模型
 │   └── static/
-│       ├── index.html     # 编辑器 + 结果区 + 模板工作台弹窗
+│       ├── index.html     # 编辑器 + 结果区 + 执行记录弹窗 + 模板工作台弹窗
 │       ├── app.js         # 原生 JS：表格编辑、Canvas 甘特图、拖拽、场景、导出
+│       ├── executions.js  # 执行记录工作台：逐任务登记、保存校验、偏差与未执行项展示
 │       ├── templates.js   # 模板工作台：变量编辑、参数预览、迷你甘特、实例化
 │       └── styles.css
 ├── test_scheduler.py      # 排程核心测试（53 项断言，无需第三方库）
 ├── test_templating.py     # 模板引擎测试（47 项断言，无需第三方库）
+├── test_executions.py     # 执行记录校验/偏差/原子写入测试（43 项断言，无需第三方库）
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
 ```
 
-运行后端测试：
+运行后端测试（`test_executions.py` 与排程/模板测试一样，仅用标准库，无需安装 FastAPI）：
 
 ```bash
-pip install -r requirements.txt   # 测试仅依赖 fastapi（含 pydantic）
+pip install -r requirements.txt   # 仅运行服务/HTTP 测试时需要 fastapi（含 pydantic）
 python test_scheduler.py
 python test_templating.py
+python test_executions.py
 ```
 
 ---
@@ -340,3 +414,7 @@ python test_templating.py
 - **时间按什么时区？** 前端使用浏览器本地时间生成 `datetime-local`，后端按朴素时间存储与计算，
   不做时区换算；容器与使用者在同一时区语义下即可。
 - **资源容量能是小数吗？** 可以，如某资源 0.5 的占用也支持。
+- **执行记录存在哪？改了场景计划后偏差会变吗？** 执行记录单独存于命名卷
+  `scheduler-data` 的 `execution_records` 表；开始/时长偏差在每次查看或保存时按场景
+  **当前计划**实时重算，因此调整任务/时长并重新保存场景后，偏差基线会随之更新。
+  记录按任务 ID 关联：删除场景会级联删除，计划里没有对应 ID 的旧记录会在报告中标为 `dangling`。

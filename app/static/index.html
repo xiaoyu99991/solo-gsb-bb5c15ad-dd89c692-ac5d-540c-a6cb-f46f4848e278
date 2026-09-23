@@ -18,6 +18,7 @@
       <button id="btnLoad" class="btn">↺ 恢复</button>
       <button id="btnDelete" class="btn btn-danger" title="删除当前场景">🗑</button>
       <button id="btnExport" class="btn btn-primary">⬇ 导出 JSON</button>
+      <button id="btnExecutions" class="btn" title="为已保存场景的每个计划任务填写实际执行情况">📋 执行记录</button>
       <button id="btnTemplates" class="btn">🧩 场景模板</button>
       <button id="btnSample" class="btn">示例</button>
     </div>
@@ -237,7 +238,57 @@
     </div>
   </div>
 
+  <!-- 实际执行记录工作台 -->
+  <div id="execModal" class="modal-mask hidden">
+    <div class="modal exec-modal">
+      <div class="modal-head">
+        <b>📋 实际执行记录 <span class="hint" id="execScenarioName"></span></b>
+        <div class="modal-head-actions">
+          <button id="execBtnFillPlanned" class="btn btn-small"
+            title="把所有已执行行的空时间批量填为计划开始/结束时间">↧ 按计划时间填充空项</button>
+          <button id="execBtnSave" class="btn btn-small btn-primary">💾 保存执行记录</button>
+          <button id="execBtnClose" class="btn btn-small">✕ 关闭</button>
+        </div>
+      </div>
+
+      <div class="modal-body exec-body">
+        <div class="exec-toolbar">
+          <div id="execSummary" class="exec-summary"></div>
+          <div id="execIssueBox" class="tpl-issue-box has-error hidden"></div>
+          <div id="execReportBar" class="exec-report-bar hidden"></div>
+        </div>
+
+        <div class="exec-table-wrap">
+          <table class="mini-table exec-table" id="execTable">
+            <thead>
+              <tr>
+                <th style="width:130px">任务</th>
+                <th style="width:126px">计划开始/结束</th>
+                <th style="width:96px">状态</th>
+                <th style="width:158px">实际开始</th>
+                <th style="width:158px">实际结束</th>
+                <th>未执行原因 / 偏差</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div id="execSkippedBox" class="exec-skipped-box hidden">
+          <h4>🚫 未执行项</h4>
+          <ul id="execSkippedList"></ul>
+        </div>
+      </div>
+
+      <div class="modal-foot hint">
+        每个计划任务恰好一条记录：已执行须填写实际开始与结束时间（结束不得早于开始）；
+        未执行须说明原因。任一项不合法都会拒绝<b>整次保存</b>，不留下部分数据。
+      </div>
+    </div>
+  </div>
+
   <script src="/static/templates.js"></script>
+  <script src="/static/executions.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

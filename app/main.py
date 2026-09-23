@@ -12,8 +12,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from .models import ScenarioIn, TemplateIn, TemplatePreviewIn, TemplateInstantiateIn
-from . import scheduler, templating
+from .models import (
+    ScenarioIn, TemplateIn, TemplatePreviewIn, TemplateInstantiateIn,
+    ExecutionsIn,
+)
+from . import scheduler, templating, executions
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("MW_DATA_DIR", "/data"))
@@ -51,15 +54,20 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(executions.EXECUTIONS_DDL)
 
 
 @contextmanager
 def get_db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -154,9 +162,70 @@ def update_scenario(scenario_id: int, scenario: ScenarioIn) -> dict:
 def delete_scenario(scenario_id: int) -> dict:
     with get_db() as conn:
         cur = conn.execute("DELETE FROM scenarios WHERE id = ?", (scenario_id,))
+        # PRAGMA foreign_keys=ON 已级联，这里再显式清理一次以兼容旧库
+        conn.execute(
+            "DELETE FROM execution_records WHERE scenario_id = ?", (scenario_id,)
+        )
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="场景不存在")
     return {"deleted": scenario_id}
+
+
+# ---------------------------------------------------------------------------
+# 实际执行记录（每个计划任务恰好一条；整批校验 + 原子替换）
+# ---------------------------------------------------------------------------
+
+def _load_scenario_row(conn: sqlite3.Connection, scenario_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM scenarios WHERE id = ?", (scenario_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="场景不存在")
+    return row
+
+
+@app.get("/api/scenarios/{scenario_id}/executions")
+def get_executions(scenario_id: int) -> dict:
+    """返回该场景每个计划任务的执行记录与相对计划的偏差报告。"""
+    with get_db() as conn:
+        row = _load_scenario_row(conn, scenario_id)
+        state = json.loads(row["data"])
+        records = executions.fetch_records(conn, scenario_id)
+    return executions.build_report(scenario_id, row["name"], state, records)
+
+
+@app.put("/api/scenarios/{scenario_id}/executions")
+def save_executions(scenario_id: int, payload: ExecutionsIn) -> dict:
+    """整批保存执行记录。
+
+    全部记录（且恰好覆盖每个计划任务一次）校验通过后才在同一事务内
+    DELETE+INSERT 整体替换；任一任务缺时间、结束早于开始、引用无效 ID、
+    有遗漏或重复，整次保存被 422 拒绝，不写入任何部分数据。
+    """
+    with get_db() as conn:
+        row = _load_scenario_row(conn, scenario_id)
+        state = json.loads(row["data"])
+        nodes = executions._node_index(state)
+
+        raw = [r.model_dump() for r in payload.records]
+        try:
+            normalized, issues = executions.validate_records(raw, nodes)
+        except executions.ExecutionValidationError as exc:
+            raise HTTPException(status_code=422, detail={
+                "message": "执行记录结构有误，整次保存已拒绝",
+                "issues": exc.issues,
+            })
+        if issues:
+            raise HTTPException(status_code=422, detail={
+                "message": "存在不合法的执行记录，整次保存已拒绝（未写入任何数据）",
+                "issues": issues,
+            })
+
+        now = _now()
+        executions.replace_records(conn, scenario_id, normalized, now)
+        records = executions.fetch_records(conn, scenario_id)
+
+    return executions.build_report(scenario_id, row["name"], state, records)
 
 
 # ---------------------------------------------------------------------------
